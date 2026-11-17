@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/push_transcript.py\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
