@@ -1,0 +1,20 @@
+# Report data - keep the folders, ignore everything inside them
+C2_EPR/*
+VDPWR_EPR/*
+Output/*
+!C2_EPR/.gitkeep
+!VDPWR_EPR/.gitkeep
+!Output/.gitkeep
+
+# Report files anywhere
+*.pdf
+*.csv
+*.grltrace
+*.gcap
+*.gwfm
+*.bak
+*.log
+
+# Python
+__pycache__/
+*.pyc
