@@ -10,6 +10,12 @@ Step 3: In PDMerged\\PD_Merged.xml, replace the <test> blocks of
         TEST.PD.PHY.ALL.1 .. TEST.PD.PHY.ALL.3 with the ones from the C2 EPR
         run's PD_Merged.xml, keeping the target's own non-empty check
         comments (packet numbers). A backup (PD_Merged.xml.bak) is written first.
+Step 4: Update the HTML reports (TEST.PD.PHY.ALL.1 .. 3 per-test HTML,
+        PD_Merged.html, GRL_USB_PD_Report_*.html, Summary_Run_*.html) to match
+        the updated XML: result + description rows are copied from the C2 EPR
+        HTML, rows with a packet number keep the VD PWR packet number, summary
+        counts and PASS Rate are adjusted.
+Step 5: Delete PDMerged\\AMS_Run_*.html.
 
 Usage:
     python corelation.py "D:\\Corelation\\VDPWR_EPR" --c2 "D:\\Corelation\\C2_EPR"
@@ -18,6 +24,8 @@ Usage:
 """
 
 import argparse
+import html
+import math
 import os
 import re
 import shutil
@@ -34,6 +42,7 @@ XML_TEST_CASES = [f"TEST.PD.PHY.ALL.{i}" for i in range(1, 4)]
 MERGED_XML = "PD_Merged.xml"
 ENTRY_TO_DELETE = "testresult.deb"
 REPORT_EXTENSIONS = {".pdf", ".csv"}
+C2_STEPS = {"3", "4"}  # steps that need the C2 EPR run
 
 SEVEN_ZIP_CANDIDATES = [
     r"C:\Program Files\7-Zip\7z.exe",
@@ -49,6 +58,17 @@ TEST_BLOCK_RES = {
 SCORE_RE = re.compile(r'<score value="([^"]*)"')
 CHECK_RE = re.compile(r'(<check checkID="([^"]+)">.*?<comment>)(.*?)(</comment>)',
                       re.DOTALL)
+
+# HTML reports (steps 4 and 5)
+MERGED_HTML = "PD_Merged.html"
+RUN_REPORT_GLOBS = ("GRL_USB_PD_Report_*.html", "Summary_Run_*.html")  # in the run folder
+AMS_GLOB = "AMS_Run_*.html"
+TR_RE = re.compile(r"<tr\b.*?</tr>", re.DOTALL)
+TD_RE = re.compile(r"<td\b.*?</td>", re.DOTALL)
+TH_RE = re.compile(r"<th\b.*?</th>", re.DOTALL)
+H1_RE = re.compile(r"<h1\b.*?</h1>", re.DOTALL)
+DETAIL_HEADER_MARK = "background-color:#031B6130;"  # first row of a test's detail block
+PACKET_RE = re.compile(r"\bPacket\d+\b")
 
 
 # ---------------------------------------------------------------- helpers
@@ -254,13 +274,269 @@ def step3_copy_c2_results(pdmerged: Path, c2_blocks: dict, dry_run=False, log=pr
         log("  saved")
 
 
+# ---------------------------------------------------------------- HTML helpers
+def cell_text(fragment: str) -> str:
+    """Visible text of an HTML fragment, whitespace collapsed."""
+    text = html.unescape(re.sub(r"<[^>]+>", " ", fragment.replace("&nbsp", " ")))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def tc_pattern(tc: str):
+    # \b stops TEST.PD.PHY.ALL.1 from matching TEST.PD.PHY.ALL.10
+    return re.compile(re.escape(tc) + r"\b")
+
+
+def find_summary_row(text: str, tc: str):
+    """Row of the 'Result Summary' table: <td><p><b>TEST.ID</b></p></td> ... result."""
+    cell = f"<b>{tc}</b>"
+    for m in TR_RE.finditer(text):
+        if cell in m.group(0):
+            return m
+    return None
+
+
+def find_detail_block(text: str, tc: str):
+    """(header row match, body start, body end) of a test's detail rows."""
+    pat = tc_pattern(tc)
+    for m in TR_RE.finditer(text):
+        row = m.group(0)
+        if DETAIL_HEADER_MARK in row and pat.search(cell_text(row)):
+            end = text.find("</table>", m.end())
+            nxt = text.find(DETAIL_HEADER_MARK, m.end(), end)
+            if nxt != -1:
+                end = text.rfind("<tr", m.end(), nxt)
+            return m, m.end(), end
+    return None
+
+
+def merge_packet_rows(c2_body: str, target_body: str):
+    """C2 detail rows, but rows naming a packet keep the target's packet row.
+    Packet rows are paired in order per label ('SourceCap', 'Request', '')."""
+    target_rows = {}
+    for row in TR_RE.findall(target_body):
+        text = cell_text(row)
+        if PACKET_RE.search(text):
+            target_rows.setdefault(PACKET_RE.sub("", text).strip(), []).append(row)
+    kept_c2 = []
+
+    def swap(m):
+        text = cell_text(m.group(0))
+        if not PACKET_RE.search(text):
+            return m.group(0)
+        rows = target_rows.get(PACKET_RE.sub("", text).strip())
+        if rows:
+            return rows.pop(0)
+        kept_c2.append(text)  # target has no packet for it -> C2 value stays
+        return m.group(0)
+
+    return TR_RE.sub(swap, c2_body), kept_c2
+
+
+def table_after(text: str, heading: str):
+    """(start, end) of the first <table> after the <h1> containing heading."""
+    for h in H1_RE.finditer(text):
+        if heading in cell_text(h.group(0)):
+            start = text.find("<table", h.end())
+            end = text.find("</table>", start)
+            if start != -1 and end != -1:
+                return start, end
+    return None
+
+
+def moi_of(text: str, pos: int) -> str:
+    """MOI name from the '<MOI>- Result Summary' heading above pos."""
+    name = ""
+    for h in H1_RE.finditer(text, 0, pos):
+        t = cell_text(h.group(0))
+        if "Result Summary" in t:
+            name = t.split("- Result Summary")[0].strip()
+    return name
+
+
+def adjust_counts(text: str, moves, log) -> str:
+    """moves: list of (moi, old_status, new_status). Update 'Test Summary - Overall'
+    and 'Test Summary - All MOI' counts and PASS Rate."""
+    def fix_row(row: str, headers, label, delta):
+        cells = list(TD_RE.finditer(row))
+        values = [cell_text(c.group(0)) for c in cells]
+        idx = {h.upper(): i for i, h in enumerate(headers)}
+        try:
+            p, f = idx["PASS"], idx["FAIL"]
+            rate = next(i for h, i in idx.items() if h.startswith("PASS RATE"))
+            old_rate_ok = values[rate] == pass_rate(int(values[p]), int(values[f]))
+            for status, d in delta.items():
+                i = idx[status.upper()]
+                values[i] = str(int(values[i]) + d)
+        except (KeyError, StopIteration, ValueError) as e:
+            log(f"    {label}: counts not updated ({e})")
+            return row
+        if old_rate_ok:
+            values[rate] = pass_rate(int(values[p]), int(values[f]))
+        else:
+            log(f"    {label}: PASS Rate left as is (unknown formula)")
+        out, last = [], 0
+        for c, v in zip(cells, values):
+            old = cell_text(c.group(0))
+            out.append(row[last:c.start()])
+            out.append(c.group(0) if old == v else
+                       c.group(0).replace(f"<b>{old}</b>", f"<b>{v}</b>", 1))
+            last = c.end()
+        out.append(row[last:])
+        return "".join(out)
+
+    def delta_for(items):
+        d = {}
+        for _, old, new in items:
+            d[old] = d.get(old, 0) - 1
+            d[new] = d.get(new, 0) + 1
+        return {k: v for k, v in d.items() if v}
+
+    for heading, per_moi in (("Test Summary - Overall", False),
+                             ("Test Summary - All MOI", True)):
+        span = table_after(text, heading)
+        if not span:
+            continue
+        table = text[span[0]:span[1]]
+        headers = [cell_text(h) for h in TH_RE.findall(table)]
+        new_table, last = [], 0
+        for m in TR_RE.finditer(table):
+            row = m.group(0)
+            if "<td" not in row:
+                continue
+            if per_moi:
+                moi = cell_text(TD_RE.search(row).group(0))
+                delta = delta_for([mv for mv in moves if mv[0] == moi])
+            else:
+                moi, delta = "Overall", delta_for(moves)
+            if not delta:
+                continue
+            new_table += [table[last:m.start()], fix_row(row, headers, moi, delta)]
+            last = m.end()
+            log(f"    counts {moi}: {delta}")
+        new_table.append(table[last:])
+        text = text[:span[0]] + "".join(new_table) + text[span[1]:]
+    return text
+
+
+def pass_rate(passed: int, failed: int) -> str:
+    # the GRL report rounds down: 118 / (118 + 4) = 96.7 -> 96%
+    total = passed + failed
+    return f"{math.floor(passed * 100 / total) if total else 0}%"
+
+
+def update_html(target: Path, c2_file: Path, xml_status: dict, dry_run, log):
+    """Copy result + description of the XML test cases from c2_file into target."""
+    rel = target.name
+    if not c2_file or not c2_file.is_file():
+        log(f"  {rel}: no matching C2 EPR file - skipped")
+        return
+    text, c2 = read_text(target), read_text(c2_file)
+    moves, changed = [], False
+    for tc in XML_TEST_CASES:
+        row, c2_row = find_summary_row(text, tc), find_summary_row(c2, tc)
+        if not row:
+            continue  # test not in this report
+        if not c2_row:
+            log(f"  {rel} {tc}: not in C2 EPR report - skipped")
+            continue
+        old_td = TD_RE.findall(row.group(0))[-1]  # last cell = Test Result
+        new_td = TD_RE.findall(c2_row.group(0))[-1]
+        old, new = cell_text(old_td), cell_text(new_td)
+        if xml_status.get(tc, "").upper() != new.upper():
+            log(f"  {rel} {tc}: XML says '{xml_status.get(tc)}', C2 HTML says "
+                f"'{new}' - skipped (run step 3 first)")
+            continue
+
+        # detail block first (it is after the summary row, so offsets stay valid)
+        det, c2_det = find_detail_block(text, tc), find_detail_block(c2, tc)
+        if det and c2_det:
+            hdr, b0, b1 = det
+            c2_hdr, c0, c1 = c2_det
+            body, kept_c2 = merge_packet_rows(c2[c0:c1], text[b0:b1])
+            hdr_tds = TD_RE.findall(hdr.group(0))
+            new_hdr = hdr.group(0).replace(hdr_tds[0], TD_RE.findall(c2_hdr.group(0))[0], 1)
+            if new_hdr + body != text[hdr.start():b1]:
+                text = text[:hdr.start()] + new_hdr + body + text[b1:]
+                changed = True
+            for k in kept_c2:
+                log(f"  {rel} {tc}: no VD PWR packet for '{k}' - C2 value kept")
+        elif det or c2_det:  # e.g. Summary_Run has no detail rows at all
+            log(f"  {rel} {tc}: detail rows not found - only the result is updated")
+
+        if old != new:
+            row = find_summary_row(text, tc)
+            last = list(TD_RE.finditer(row.group(0)))[-1]
+            new_row = row.group(0)[:last.start()] + new_td + row.group(0)[last.end():]
+            text = text[:row.start()] + new_row + text[row.end():]
+            moves.append((moi_of(text, row.start()), old, new))
+            changed = True
+        log(f"  {rel} {tc}: {old} -> {new}" if old != new else f"  {rel} {tc}: {new}")
+
+    if moves:
+        text = adjust_counts(text, moves, log)
+    if not changed:
+        log(f"  {rel}: already up to date")
+    elif not dry_run:
+        backup = target.with_name(target.name + ".bak")
+        if not backup.exists():
+            shutil.copy2(target, backup)
+        write_text(target, text)
+        log(f"  {rel}: saved")
+
+
+def xml_test_status(xml: Path) -> dict:
+    text = read_text(xml) if xml.is_file() else ""
+    out = {}
+    for tc, pattern in TEST_BLOCK_RES.items():
+        m = pattern.search(text)
+        if m:
+            out[tc] = block_scores(m.group(0))[0]
+    return out
+
+
+# ---------------------------------------------------------------- Step 4
+def step4_update_html(pdmerged: Path, c2_pdmerged: Path, dry_run=False, log=print):
+    log(f"\n[Step 4] {pdmerged.parent}")
+    xml_status = xml_test_status(pdmerged / MERGED_XML)
+    if not xml_status:
+        log(f"  {MERGED_XML} missing or has no {XML_TEST_CASES[0]}.. - skipped")
+        return
+    pairs = [(pdmerged / tc / f"{tc}.html", c2_pdmerged / tc / f"{tc}.html")
+             for tc in XML_TEST_CASES]
+    pairs.append((pdmerged / MERGED_HTML, c2_pdmerged / MERGED_HTML))
+    for pattern in RUN_REPORT_GLOBS:
+        c2_reports = sorted(c2_pdmerged.parent.glob(pattern))
+        for report in sorted(pdmerged.parent.glob(pattern)):
+            same_name = c2_pdmerged.parent / report.name
+            pairs.append((report, same_name if same_name.is_file()
+                          else (c2_reports[0] if len(c2_reports) == 1 else None)))
+    for target, c2_file in pairs:
+        if target.is_file():
+            update_html(target, c2_file, xml_status, dry_run, log)
+
+
+# ---------------------------------------------------------------- Step 5
+def step5_delete_ams(pdmerged: Path, dry_run=False, log=print):
+    log(f"\n[Step 5] {pdmerged}")
+    ams_files = sorted(pdmerged.glob(AMS_GLOB))
+    if not ams_files:
+        log("  no AMS HTML file - nothing to delete")
+    for f in ams_files:
+        if dry_run:
+            log(f"  would delete {f.name}")
+        else:
+            f.unlink()
+            log(f"  deleted {f.name}")
+
+
 # ---------------------------------------------------------------- driver
 def process(folders, c2, steps, dry_run=False, log=print):
     """Run the selected steps on every PDMerged folder under `folders`."""
-    c2_blocks, c2_run = None, None
-    if "3" in steps:
+    c2_blocks, c2_run, c2_pdmerged = None, None, None
+    if steps & C2_STEPS:
         c2_xml = find_c2_xml(Path(c2))
-        c2_run = c2_xml.parent.parent.resolve()
+        c2_pdmerged = c2_xml.parent
+        c2_run = c2_pdmerged.parent.resolve()
         c2_blocks = load_c2_blocks(c2_xml)
         log(f"C2 EPR source: {c2_xml}")
 
@@ -289,6 +565,10 @@ def process(folders, c2, steps, dry_run=False, log=print):
                 step2_delete_reports(pdmerged, dry_run, log)
             if "3" in steps:
                 step3_copy_c2_results(pdmerged, c2_blocks, dry_run, log)
+            if "4" in steps:
+                step4_update_html(pdmerged, c2_pdmerged, dry_run, log)
+            if "5" in steps:
+                step5_delete_ams(pdmerged, dry_run, log)
 
     log("\nDone." + (" (dry run - nothing changed)" if dry_run else ""))
 
@@ -297,10 +577,10 @@ def main():
     parser = argparse.ArgumentParser(description="Corelation report preparation")
     parser.add_argument("folders", nargs="*",
                         help="Input folder(s); every PDMerged folder below is processed")
-    parser.add_argument("--steps", default="1,2,3",
-                        help="Comma separated steps to run (default: 1,2,3)")
+    parser.add_argument("--steps", default="1,2,3,4,5",
+                        help="Comma separated steps to run (default: 1,2,3,4,5)")
     parser.add_argument("--c2",
-                        help="C2 EPR run folder (or its PD_Merged.xml) used by step 3")
+                        help="C2 EPR run folder (or its PD_Merged.xml) used by steps 3-4")
     parser.add_argument("--dry-run", action="store_true",
                         help="Only show what would be changed")
     args = parser.parse_args()
@@ -314,10 +594,10 @@ def main():
 
     steps = {s.strip() for s in args.steps.split(",")}
     c2 = None
-    if "3" in steps:
+    if steps & C2_STEPS:
         c2 = args.c2 or input("Enter C2 EPR folder path: ").strip().strip('"')
         if not c2:
-            sys.exit("Step 3 needs the C2 EPR folder (--c2).")
+            sys.exit("Steps 3-4 need the C2 EPR folder (--c2).")
     try:
         process(folders, c2, steps, args.dry_run)
     except ValueError as e:
