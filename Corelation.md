@@ -15,6 +15,14 @@ The VD PWR folder is copied to `<output>\VDPWR_EPR\` and all changes are made on
    - Keep VD PWR's own packet comments (e.g. Packet63 / Packet73).
    - Original is saved as `PD_Merged.xml.bak`.
 
+4. **Update HTML** – the per-test HTML of `TEST.PD.PHY.ALL.1` to `.3`, `PD_Merged.html`, `GRL_USB_PD_Report_*.html`, `Summary_Run_*.html`
+   - Result and description rows are copied from the C2 EPR HTML (only where the updated XML has the same result).
+   - Rows with a packet number keep the VD PWR packet number.
+   - PASS / INCOMPLETE counts and PASS Rate in the summary tables are adjusted.
+   - Originals are saved as `.bak`.
+
+5. **Delete AMS** – delete `PDMerged\AMS_Run_*.html`.
+
 ## Run
 
 - UI: `python corelation_ui.py`

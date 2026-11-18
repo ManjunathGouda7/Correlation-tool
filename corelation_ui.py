@@ -4,11 +4,12 @@ Small UI for corelation.py
 1. Pick the VD PWR input folder, the C2 EPR folder and an output folder.
 2. The input is copied to  <output>\\VDPWR_EPR\\<input folder name>
    (the original input folder is never changed).
-3. Steps 1-3 of corelation.py run on that copy.
+3. Steps 1-5 of corelation.py run on that copy.
 
 Run:  python corelation_ui.py
 """
 
+import json
 import os
 import queue
 import shutil
@@ -21,10 +22,21 @@ from tkinter.scrolledtext import ScrolledText
 import corelation
 
 OUTPUT_SUBFOLDER = "VDPWR_EPR"
+# last used paths and steps, restored when the UI opens again
+SETTINGS_FILE = Path(__file__).resolve().with_name("corelation_ui_settings.json")
+STEP_TEXTS = {
+    "1": "1. Delete testresult.deb from PHY.ALL.1-5 .grltrace",
+    "2": "2. Delete PDF and CSV report files",
+    "3": "3. Copy C2 EPR pass results into PD_Merged.xml (PHY.ALL.1-3)",
+    "4": "4. Update HTML reports from the XML / C2 EPR (PHY.ALL.1-3)",
+    "5": "5. Delete the AMS HTML (PDMerged\\AMS_Run_*.html)",
+}
 
 
 def destination_for(input_dir: Path, output_dir: Path) -> Path:
-    base = output_dir / OUTPUT_SUBFOLDER
+    # output folder already called VDPWR_EPR -> use it as is
+    base = (output_dir if output_dir.name.lower() == OUTPUT_SUBFOLDER.lower()
+            else output_dir / OUTPUT_SUBFOLDER)
     # input already called VDPWR_EPR -> don't nest VDPWR_EPR\VDPWR_EPR
     if input_dir.name.lower() == OUTPUT_SUBFOLDER.lower():
         return base
@@ -43,7 +55,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Corelation - VD PWR EPR report update")
-        self.geometry("820x560")
+        self.geometry("820x600")
         self.minsize(640, 420)
         self.log_queue = queue.Queue()
         self.worker = None
@@ -51,10 +63,39 @@ class App(tk.Tk):
         self.input_var = tk.StringVar()
         self.c2_var = tk.StringVar()
         self.output_var = tk.StringVar()
-        self.step_vars = {s: tk.BooleanVar(value=True) for s in ("1", "2", "3")}
+        self.step_vars = {s: tk.BooleanVar(value=True) for s in STEP_TEXTS}
+        self._load_settings()
 
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_log)
+
+    # ------------------------------------------------------------ settings
+    def _path_vars(self):
+        return {"input": self.input_var, "c2": self.c2_var, "output": self.output_var}
+
+    def _load_settings(self):
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # first start or unreadable file: start empty
+        for key, var in self._path_vars().items():
+            var.set(data.get(key, ""))
+        for s, checked in data.get("steps", {}).items():
+            if s in self.step_vars:
+                self.step_vars[s].set(bool(checked))
+
+    def _save_settings(self):
+        data = {key: var.get().strip() for key, var in self._path_vars().items()}
+        data["steps"] = {s: v.get() for s, v in self.step_vars.items()}
+        try:
+            SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            pass  # not being able to remember paths must not stop the tool
+
+    def _on_close(self):
+        self._save_settings()
+        self.destroy()
 
     # ------------------------------------------------------------ layout
     def _build(self):
@@ -75,13 +116,8 @@ class App(tk.Tk):
 
         steps = ttk.LabelFrame(frm, text="Steps", padding=6)
         steps.grid(row=3, column=0, columnspan=3, sticky="ew", pady=8)
-        texts = {
-            "1": "1. Delete testresult.deb from PHY.ALL.1-5 .grltrace",
-            "2": "2. Delete PDF and CSV report files",
-            "3": "3. Copy C2 EPR pass results into PD_Merged.xml (PHY.ALL.1-3)",
-        }
-        for i, s in enumerate(("1", "2", "3")):
-            ttk.Checkbutton(steps, text=texts[s], variable=self.step_vars[s]) \
+        for i, (s, text) in enumerate(STEP_TEXTS.items()):
+            ttk.Checkbutton(steps, text=text, variable=self.step_vars[s]) \
                 .grid(row=i, column=0, sticky="w")
 
         btns = ttk.Frame(frm)
@@ -102,6 +138,7 @@ class App(tk.Tk):
         path = filedialog.askdirectory(initialdir=var.get() or None)
         if path:
             var.set(str(Path(path)))
+            self._save_settings()
 
     def _open_output(self):
         dest = getattr(self, "last_dest", None)
@@ -121,8 +158,8 @@ class App(tk.Tk):
             return messagebox.showerror("Output", "Select an output folder.")
         if not steps:
             return messagebox.showerror("Steps", "Select at least one step.")
-        if "3" in steps and (not c2 or not Path(c2).exists()):
-            return messagebox.showerror("C2 EPR", "Select a valid C2 EPR folder for step 3.")
+        if steps & corelation.C2_STEPS and (not c2 or not Path(c2).exists()):
+            return messagebox.showerror("C2 EPR", "Select a valid C2 EPR folder for steps 3-4.")
 
         out = Path(out)
         dest = destination_for(inp, out)
@@ -135,6 +172,7 @@ class App(tk.Tk):
                     f"{dest}\nalready exists.\n\nDelete it and create it again from the input?"):
                 return
 
+        self._save_settings()
         self.run_btn.config(state="disabled")
         self.open_btn.config(state="disabled")
         self.last_dest = dest

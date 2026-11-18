@@ -18,3 +18,6 @@ Output/*
 # Python
 __pycache__/
 *.pyc
+
+# local UI paths
+corelation_ui_settings.json
