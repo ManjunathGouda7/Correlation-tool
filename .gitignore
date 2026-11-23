@@ -21,3 +21,6 @@ __pycache__/
 
 # local UI paths
 corelation_ui_settings.json
+
+# Generated comparison output
+Comparison_Output/

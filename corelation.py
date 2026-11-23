@@ -228,6 +228,63 @@ def find_c2_xml(c2_path: Path) -> Path:
     return candidates[0]
 
 
+TID_RE = re.compile(r"TID[ _]*(\d+)", re.I)
+RUN_TID_RE = re.compile(r"(?<!\d)(\d{5})_", re.I)  # "16394_PD_..." run folder names
+
+
+def tid_of(path: Path):
+    """DUT id from a path: last 'TID xxxxx' folder, else a '16394_...' folder name."""
+    found = TID_RE.findall(str(path))
+    if found:
+        return found[-1]
+    found = RUN_TID_RE.findall(str(path))
+    return found[-1] if found else None
+
+
+def c2_run_index(c2_root: Path, log=print) -> dict:
+    """{tid: [(pdmerged, blocks), ...]} for every C2 EPR run under c2_root.
+    Copies of another DUT nested inside a TID folder (TID 16557\\TID 16502\\..)
+    are left out so a run is not counted twice."""
+    index = {}
+    for pdm in find_pdmerged_folders(c2_root):
+        rel = pdm.relative_to(c2_root) if pdm != c2_root else Path(pdm.name)
+        if len(TID_RE.findall(str(rel))) > 1:
+            log(f"  ignoring nested copy: {rel}")
+            continue
+        xml = pdm / MERGED_XML
+        tid = tid_of(pdm)
+        if tid and xml.is_file():
+            index.setdefault(tid, []).append((pdm, load_c2_blocks(xml)))
+    return index
+
+
+def c2_plan(runs) -> tuple:
+    """Pick the C2 source for each PHY test case of one DUT.
+    Main source = the 'PD' run (not Flip / Updated) that has all test cases.
+    A test case that does not pass there is taken from another non-Flip run
+    (e.g. '..._PD_Updated') where it passes.
+    Returns ([(pdmerged, {tc: block})...], problem text or None)."""
+    def name(pdm):
+        return str(pdm).lower()
+    not_flip = [r for r in runs if "flip" not in name(r[0])]
+    main = [r for r in not_flip if "updated" not in name(r[0])
+            and all(tc in r[1] for tc in XML_TEST_CASES)]
+    if len(main) != 1:
+        return [], f"expected one C2 EPR PD run with {XML_TEST_CASES[0]}..3, found {len(main)}"
+    main_pdm, main_blocks = main[0]
+    plan = {main_pdm: dict(main_blocks)}
+    for tc, block in main_blocks.items():
+        if block_scores(block)[0].lower() == "pass":
+            continue
+        for pdm, blocks in not_flip:
+            if pdm != main_pdm and tc in blocks and \
+                    block_scores(blocks[tc])[0].lower() == "pass":
+                del plan[main_pdm][tc]
+                plan.setdefault(pdm, {})[tc] = blocks[tc]
+                break
+    return list(plan.items()), None
+
+
 def load_c2_blocks(c2_xml: Path) -> dict:
     """Read the C2 EPR xml once and keep only the test blocks we need."""
     text = read_text(c2_xml)
@@ -424,7 +481,8 @@ def pass_rate(passed: int, failed: int) -> str:
     return f"{math.floor(passed * 100 / total) if total else 0}%"
 
 
-def update_html(target: Path, c2_file: Path, xml_status: dict, dry_run, log):
+def update_html(target: Path, c2_file: Path, xml_status: dict, dry_run, log,
+                test_cases=XML_TEST_CASES):
     """Copy result + description of the XML test cases from c2_file into target."""
     rel = target.name
     if not c2_file or not c2_file.is_file():
@@ -432,7 +490,7 @@ def update_html(target: Path, c2_file: Path, xml_status: dict, dry_run, log):
         return
     text, c2 = read_text(target), read_text(c2_file)
     moves, changed = [], False
-    for tc in XML_TEST_CASES:
+    for tc in test_cases:
         row, c2_row = find_summary_row(text, tc), find_summary_row(c2, tc)
         if not row:
             continue  # test not in this report
@@ -495,14 +553,16 @@ def xml_test_status(xml: Path) -> dict:
 
 
 # ---------------------------------------------------------------- Step 4
-def step4_update_html(pdmerged: Path, c2_pdmerged: Path, dry_run=False, log=print):
-    log(f"\n[Step 4] {pdmerged.parent}")
+def step4_update_html(pdmerged: Path, c2_pdmerged: Path, dry_run=False, log=print,
+                      test_cases=XML_TEST_CASES):
+    log(f"\n[Step 4] {pdmerged.parent}"
+        + (f"  ({', '.join(test_cases)})" if list(test_cases) != XML_TEST_CASES else ""))
     xml_status = xml_test_status(pdmerged / MERGED_XML)
     if not xml_status:
         log(f"  {MERGED_XML} missing or has no {XML_TEST_CASES[0]}.. - skipped")
         return
     pairs = [(pdmerged / tc / f"{tc}.html", c2_pdmerged / tc / f"{tc}.html")
-             for tc in XML_TEST_CASES]
+             for tc in test_cases]
     pairs.append((pdmerged / MERGED_HTML, c2_pdmerged / MERGED_HTML))
     for pattern in RUN_REPORT_GLOBS:
         c2_reports = sorted(c2_pdmerged.parent.glob(pattern))
@@ -512,7 +572,7 @@ def step4_update_html(pdmerged: Path, c2_pdmerged: Path, dry_run=False, log=prin
                           else (c2_reports[0] if len(c2_reports) == 1 else None)))
     for target, c2_file in pairs:
         if target.is_file():
-            update_html(target, c2_file, xml_status, dry_run, log)
+            update_html(target, c2_file, xml_status, dry_run, log, test_cases)
 
 
 # ---------------------------------------------------------------- Step 5
@@ -531,14 +591,26 @@ def step5_delete_ams(pdmerged: Path, dry_run=False, log=print):
 
 # ---------------------------------------------------------------- driver
 def process(folders, c2, steps, dry_run=False, log=print):
-    """Run the selected steps on every PDMerged folder under `folders`."""
-    c2_blocks, c2_run, c2_pdmerged = None, None, None
+    """Run the selected steps on every PDMerged folder under `folders`.
+    c2 = one C2 EPR run (used for every target), or a folder with many C2 EPR
+    runs: each target is then paired with the C2 run of the same TID."""
+    c2_index, c2_runs = None, set()   # by-TID mode
+    single = None                     # [(c2_pdmerged, blocks)] in single-run mode
     if steps & C2_STEPS:
-        c2_xml = find_c2_xml(Path(c2))
-        c2_pdmerged = c2_xml.parent
-        c2_run = c2_pdmerged.parent.resolve()
-        c2_blocks = load_c2_blocks(c2_xml)
-        log(f"C2 EPR source: {c2_xml}")
+        c2_path = Path(c2)
+        xmls = ([c2_path] if c2_path.is_file() else
+                [p / MERGED_XML for p in find_pdmerged_folders(c2_path)
+                 if (p / MERGED_XML).is_file()])
+        if not xmls:
+            raise ValueError(f"No {PDMERGED}\\{MERGED_XML} under {c2_path}")
+        if len(xmls) == 1:
+            single = [(xmls[0].parent, load_c2_blocks(xmls[0]))]
+            log(f"C2 EPR source: {xmls[0]}")
+        else:
+            log(f"C2 EPR folder with {len(xmls)} runs - pairing by TID: {c2_path}")
+            c2_index = c2_run_index(c2_path, log)
+            log(f"  C2 EPR DUTs: {', '.join(sorted(c2_index))}")
+        c2_runs = {x.parent.parent.resolve() for x in xmls}
 
     seven_zip = None
     if "1" in steps:
@@ -556,17 +628,28 @@ def process(folders, c2, steps, dry_run=False, log=print):
             log(f"\nNo {PDMERGED} folder under: {root}")
             continue
         for pdmerged in pdmerged_list:
-            if c2_run and pdmerged.parent.resolve() == c2_run:
+            if pdmerged.parent.resolve() in c2_runs:
                 log(f"\nSkipping C2 EPR source run: {pdmerged}")
                 continue
+            plan = single
+            if c2_index is not None:
+                tid = tid_of(pdmerged)
+                log(f"\n======== TID {tid}: {pdmerged.parent}")
+                plan, problem = c2_plan(c2_index.get(tid, []))
+                if problem:
+                    log(f"  C2 EPR: {problem} - steps 3-4 skipped")
+                for c2_pdm, blocks in plan:
+                    log(f"  C2 EPR source for {', '.join(sorted(blocks))}: {c2_pdm.parent}")
             if "1" in steps:
                 step1_remove_testresult(pdmerged, seven_zip, dry_run, log)
             if "2" in steps:
                 step2_delete_reports(pdmerged, dry_run, log)
-            if "3" in steps:
-                step3_copy_c2_results(pdmerged, c2_blocks, dry_run, log)
-            if "4" in steps:
-                step4_update_html(pdmerged, c2_pdmerged, dry_run, log)
+            for c2_pdm, blocks in (plan or []):
+                if "3" in steps:
+                    step3_copy_c2_results(pdmerged, blocks, dry_run, log)
+                if "4" in steps:
+                    step4_update_html(pdmerged, c2_pdm, dry_run, log,
+                                      [tc for tc in XML_TEST_CASES if tc in blocks])
             if "5" in steps:
                 step5_delete_ams(pdmerged, dry_run, log)
 
